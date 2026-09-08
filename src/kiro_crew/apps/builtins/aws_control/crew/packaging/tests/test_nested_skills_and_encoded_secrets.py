@@ -179,6 +179,22 @@ def _no_dir_fd(mod_loader):
     )
 
 
+def test_an_external_prompt_inlines_end_to_end_without_dir_fd(tmp_path: pathlib.Path) -> None:
+    """The feature the refusal broke, driven through the real build rather than the opener.
+
+    A unit test of the opener would have stayed green under the refusal too, because the
+    refusal was correct at that level. What it broke was the build, which is what this
+    asserts.
+    """
+    mod = _no_dir_fd(load_build)
+    home = make_crew(tmp_path / "home", prompt="file://persona.md")
+    (home / "agents" / "persona.md").write_bytes(b"an external persona\n")
+    crew = mod.resolve_crew("frontdesk", home)
+    spec = mod.read_agent_spec(crew)
+    result = mod.build_spec(crew, spec, set(), crew.agent_spec_path.parent)
+    assert result.spec["prompt"] == "an external persona\n"
+
+
 def test_skills_still_ship_where_dir_fd_is_unavailable(tmp_path: pathlib.Path) -> None:
     """Skill files do not go through the anchored opener, so they are unaffected."""
     mod = _no_dir_fd(load_build)
