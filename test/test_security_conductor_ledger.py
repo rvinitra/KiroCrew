@@ -218,7 +218,7 @@ class TestDedupeIdentity:
 
 
 class TestSchemaMatchesTheRfc:
-    """The RFC's four tables, column for column.
+    """The RFC's five tables, column for column.
 
     A column added for convenience is a design change made in an
     implementation PR, so the shape is asserted rather than described.
@@ -260,6 +260,21 @@ class TestSchemaMatchesTheRfc:
                 ],
             ),
             ("roe_rules", ["id", "field", "value", "reason", "approved_by", "ts", "active"]),
+            (
+                "golden_paths",
+                [
+                    "id",
+                    "kind",
+                    "surface",
+                    "command_or_flow",
+                    "platform",
+                    "reason",
+                    "source_finding_id",
+                    "approved_by",
+                    "ts",
+                    "active",
+                ],
+            ),
             ("schema_version", ["version"]),
         ],
     )
@@ -430,11 +445,11 @@ class TestApprovalSurvivesADeactivation:
 class TestNoWriteIsGatedOnlyByAPythonRead:
     """The invariant the retrospective produced, as a scan.
 
-    Four rounds produced four findings in one span, and every one was the same
-    mechanism: a Python read-then-write deciding whether a write was safe, where
-    the database should have been the authority. Rounds 0, 2 and 4 were
-    check-then-act (dedupe, approval, schema version); round 1 was the read-path
-    variant (trusting a wall clock over the append order the table records).
+    Four findings in one span shared one mechanism: a Python read-then-write
+    deciding whether a write was safe, where the database should have been the
+    authority. Three were check-then-act (dedupe, approval, schema version); the
+    fourth was the read-path variant of the same mistake -- trusting a wall clock
+    over the append order the table records.
 
     These assertions cover the write that does not exist yet, which is the only
     way to stop a fifth instance.
@@ -1372,11 +1387,11 @@ class TestRequiredArgumentsMustCarryText:
 
 
 class TestTheCliDoesNotClaimToAuthenticate:
-    """GPT round-2 F1, answered as prose rather than as a guard.
+    """Answered as prose rather than as a guard, deliberately.
 
     The CLI cannot tell a human from an agent, and adding a check that pretends to
     would be the same overclaim in code. What it CAN do is not assert a boundary it
-    has not got, so the docstring now names filesystem ownership as the real one.
+    has not got, so the docstring names filesystem ownership as the real one.
     """
 
     def test_the_docstring_names_the_trust_boundary(self, mod):
@@ -1660,3 +1675,533 @@ class TestDefaultDbPath:
         assert mod.main(["--db", str(target), "init"]) == 0
         capsys.readouterr()
         assert target.exists()
+
+
+class TestGoldenPathsMigrateAdditively:
+    """A ledger written before this table existed must open, keep its rows, and
+    gain the table -- an audit in flight is exactly when a schema bump lands."""
+
+    def a_v1_database(self, path: Path) -> None:
+        """A v1 ledger, built the way one really exists on disk.
+
+        Written with raw SQL rather than by calling an older copy of the script,
+        because what has to migrate is the FILE, and reconstructing it here is the
+        only way to have one that predates the current DDL.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            CREATE UNIQUE INDEX schema_version_single ON schema_version (version);
+            INSERT INTO schema_version (version) VALUES (1);
+            CREATE TABLE findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, surface TEXT NOT NULL,
+                severity TEXT NOT NULL, title TEXT NOT NULL, paths TEXT NOT NULL,
+                poc TEXT, auditor_verdict TEXT, verifier_verdict TEXT,
+                final_verdict TEXT, status TEXT NOT NULL, created TEXT NOT NULL,
+                round_id TEXT
+            );
+            INSERT INTO findings (surface, severity, title, paths, status, created)
+                VALUES ('security', 'High', 'legacy finding', '[]', 'open',
+                        '2000-01-01T00:00:00+00:00');
+            """)
+        conn.commit()
+        conn.close()
+
+    def test_an_existing_v1_ledger_opens_and_gains_the_table(self, mod, db, capsys):
+        self.a_v1_database(db)
+        assert run(mod, db, "init") == 0
+        assert out_json(capsys)["schema_version"] == 2
+        run(mod, db, "list", "golden-paths")
+        assert out_json(capsys) == []
+
+    def test_the_migration_keeps_the_rows_that_were_there(self, mod, db, capsys):
+        """Additive means additive: the bump must not be a rebuild."""
+        self.a_v1_database(db)
+        run(mod, db, "list", "findings")
+        rows = out_json(capsys)
+        assert [row["title"] for row in rows] == ["legacy finding"]
+
+    def test_the_version_is_not_walked_backwards(self, mod, db, capsys):
+        """A ledger written by a newer checkout, opened by this one, is left alone.
+
+        The guard is ``<`` rather than ``!=`` for this case: overwriting a higher
+        version would record a downgrade whose tables this code cannot recreate.
+        """
+        run(mod, db, "init")
+        capsys.readouterr()
+        conn = mod.connect(db)
+        try:
+            with conn:
+                conn.execute("UPDATE schema_version SET version = 99")
+        finally:
+            conn.close()
+        run(mod, db, "init")
+        assert out_json(capsys)["schema_version"] == 99
+
+    def test_the_version_row_stays_a_singleton_across_the_bump(self, mod, db, capsys):
+        """The bump is an UPDATE, not an INSERT: a second row would be a second
+        answer to the question a migration ladder branches on."""
+        self.a_v1_database(db)
+        run(mod, db, "init")
+        capsys.readouterr()
+        conn = mod.connect(db)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        finally:
+            conn.close()
+        assert count == 1
+
+
+class TestGoldenPathIdentity:
+    """One row per legitimate operation, per platform."""
+
+    def test_the_same_command_is_recorded_once(self, mod, db, capsys):
+        for _ in range(2):
+            run(
+                mod,
+                db,
+                "add-golden-path",
+                "--kind",
+                "shell",
+                "--surface",
+                "gh-read",
+                "--command",
+                "gh pr view 1 --json state",
+                "--reason",
+                "reading a PR is how a loop decides what to do next",
+                "--approved-by",
+                "reviewer",
+            )
+        second = out_json(capsys)
+        assert second["created"] is False
+        assert second["id"] == 1
+
+    def test_the_platform_is_part_of_the_identity(self, mod, db, capsys):
+        """The same text is a different claim on each host, so collapsing them
+        would make importing a Windows row skip because a POSIX one is present."""
+        for platform in ("posix", "windows"):
+            run(
+                mod,
+                db,
+                "add-golden-path",
+                "--kind",
+                "shell",
+                "--surface",
+                "tests",
+                "--command",
+                "python -m pytest -n0 -q",
+                "--platform",
+                platform,
+                "--reason",
+                "the sanctioned test invocation",
+                "--approved-by",
+                "reviewer",
+            )
+            assert out_json(capsys)["created"] is True
+
+    def test_the_kind_is_part_of_the_identity(self, mod, db, capsys):
+        """A kind is a checking STRATEGY, so the same text classified and the same
+        text run are two different assertions."""
+        for kind in ("shell", "flow"):
+            run(
+                mod,
+                db,
+                "add-golden-path",
+                "--kind",
+                kind,
+                "--surface",
+                "git-read",
+                "--command",
+                "git rev-parse HEAD",
+                "--reason",
+                "the head SHA is what a lease is keyed to",
+                "--approved-by",
+                "reviewer",
+            )
+            assert out_json(capsys)["created"] is True
+
+    def test_interior_spacing_is_preserved(self, mod, db, capsys):
+        """A shell row's interior spacing is part of the shape the fence sees, so
+        normalising it would make the corpus assert a command nobody runs."""
+        spaced = "gh pr view 1 --json state ; gh run list"
+        run(
+            mod,
+            db,
+            "add-golden-path",
+            "--kind",
+            "shell",
+            "--surface",
+            "gh-read",
+            "--command",
+            f"  {spaced}  ",
+            "--reason",
+            "two reads joined by a separator were false-positive refused",
+            "--approved-by",
+            "reviewer",
+        )
+        capsys.readouterr()
+        run(mod, db, "list", "golden-paths")
+        assert out_json(capsys)[0]["command_or_flow"] == spaced
+
+
+class TestGoldenPathApprovalIsTheOnlyWideningWrite:
+    def test_a_proposed_path_is_inert(self, mod, db, capsys):
+        run(
+            mod,
+            db,
+            "propose-golden-path",
+            "--kind",
+            "shell",
+            "--surface",
+            "gh-read",
+            "--command",
+            "gh pr list --json number",
+            "--reason",
+            "enumerating PRs is the collision check",
+        )
+        assert out_json(capsys)["active"] == 0
+        conn = mod.connect(db)
+        try:
+            mod.init_schema(conn)
+            assert mod.active_golden_paths(conn, platform="posix") == []
+        finally:
+            conn.close()
+
+    def test_approval_activates_and_attributes(self, mod, db, capsys):
+        run(
+            mod,
+            db,
+            "propose-golden-path",
+            "--kind",
+            "shell",
+            "--surface",
+            "gh-read",
+            "--command",
+            "gh pr list --json number",
+            "--reason",
+            "enumerating PRs is the collision check",
+        )
+        path_id = out_json(capsys)["id"]
+        run(mod, db, "approve-golden-path", "--id", str(path_id), "--approved-by", "reviewer")
+        assert out_json(capsys) == {"active": 1, "approved_by": "reviewer", "id": path_id}
+
+    def test_approval_is_write_once(self, mod, db, capsys):
+        run(
+            mod,
+            db,
+            "propose-golden-path",
+            "--kind",
+            "shell",
+            "--surface",
+            "gh-read",
+            "--command",
+            "gh pr list --json number",
+            "--reason",
+            "enumerating PRs is the collision check",
+        )
+        path_id = out_json(capsys)["id"]
+        run(mod, db, "approve-golden-path", "--id", str(path_id), "--approved-by", "first")
+        capsys.readouterr()
+        assert (
+            run(mod, db, "approve-golden-path", "--id", str(path_id), "--approved-by", "second")
+            == 2
+        )
+        assert "already approved by 'first'" in capsys.readouterr().err
+
+    def test_a_retired_path_cannot_be_re_approved_by_someone_else(self, mod, db, capsys):
+        """Retiring is not un-approving: the row still names who admitted it, and a
+        second approval would replace that name."""
+        run(
+            mod,
+            db,
+            "propose-golden-path",
+            "--kind",
+            "shell",
+            "--surface",
+            "gh-read",
+            "--command",
+            "gh pr list --json number",
+            "--reason",
+            "enumerating PRs is the collision check",
+        )
+        path_id = out_json(capsys)["id"]
+        run(mod, db, "approve-golden-path", "--id", str(path_id), "--approved-by", "first")
+        run(mod, db, "deactivate-golden-path", "--id", str(path_id))
+        capsys.readouterr()
+        assert (
+            run(mod, db, "approve-golden-path", "--id", str(path_id), "--approved-by", "second")
+            == 2
+        )
+        assert "approved by 'first' and later retired" in capsys.readouterr().err
+
+    def test_retiring_keeps_the_approver_on_record(self, mod, db, capsys):
+        run(
+            mod,
+            db,
+            "add-golden-path",
+            "--kind",
+            "shell",
+            "--surface",
+            "gh-read",
+            "--command",
+            "gh pr list --json number",
+            "--reason",
+            "enumerating PRs is the collision check",
+            "--approved-by",
+            "reviewer",
+        )
+        path_id = out_json(capsys)["id"]
+        run(mod, db, "deactivate-golden-path", "--id", str(path_id))
+        assert out_json(capsys)["outcome"] == "retired"
+        run(mod, db, "list", "golden-paths")
+        row = out_json(capsys)[0]
+        assert row["active"] == 0
+        assert row["approved_by"] == "reviewer"
+
+    def test_retiring_a_retired_path_is_reported_not_repeated(self, mod, db, capsys):
+        run(
+            mod,
+            db,
+            "propose-golden-path",
+            "--kind",
+            "shell",
+            "--surface",
+            "gh-read",
+            "--command",
+            "gh pr list --json number",
+            "--reason",
+            "enumerating PRs is the collision check",
+        )
+        path_id = out_json(capsys)["id"]
+        assert run(mod, db, "deactivate-golden-path", "--id", str(path_id)) == 0
+        assert out_json(capsys)["outcome"] == "already"
+
+    def test_an_unknown_id_is_refused(self, mod, db, capsys):
+        assert run(mod, db, "approve-golden-path", "--id", "404", "--approved-by", "x") == 2
+        assert run(mod, db, "deactivate-golden-path", "--id", "404") == 2
+
+
+class TestGoldenPathValidation:
+    @pytest.mark.parametrize("kind", ["deploy", "SHELL", ""])
+    def test_an_unknown_kind_is_refused(self, mod, db, capsys, kind):
+        argv = [
+            "add-golden-path",
+            "--kind",
+            kind,
+            "--surface",
+            "s",
+            "--command",
+            "c",
+            "--reason",
+            "r",
+            "--approved-by",
+            "w",
+        ]
+        if kind == "":
+            with pytest.raises(SystemExit) as excinfo:
+                run(mod, db, *argv)
+            assert excinfo.value.code == 2
+        else:
+            assert run(mod, db, *argv) == 2
+
+    def test_an_unknown_platform_is_refused(self, mod, db, capsys):
+        assert (
+            run(
+                mod,
+                db,
+                "add-golden-path",
+                "--kind",
+                "shell",
+                "--surface",
+                "s",
+                "--command",
+                "c",
+                "--platform",
+                "darwin",
+                "--reason",
+                "r",
+                "--approved-by",
+                "w",
+            )
+            == 2
+        )
+        assert "unknown platform 'darwin'" in capsys.readouterr().err
+
+    def test_a_cited_finding_must_exist(self, mod, db, capsys):
+        assert (
+            run(
+                mod,
+                db,
+                "add-golden-path",
+                "--kind",
+                "shell",
+                "--surface",
+                "s",
+                "--command",
+                "c",
+                "--reason",
+                "r",
+                "--approved-by",
+                "w",
+                "--source-finding",
+                "404",
+            )
+            == 2
+        )
+        assert "no finding with id 404" in capsys.readouterr().err
+
+    def test_a_blank_reason_is_refused(self, mod, db):
+        """A golden path with no reason is a check nobody can judge when it fires."""
+        with pytest.raises(SystemExit) as excinfo:
+            run(
+                mod,
+                db,
+                "add-golden-path",
+                "--kind",
+                "shell",
+                "--surface",
+                "s",
+                "--command",
+                "c",
+                "--reason",
+                "   ",
+                "--approved-by",
+                "w",
+            )
+        assert excinfo.value.code == 2
+
+
+class TestGoldenPathCorpusImport:
+    def a_corpus(self, tmp_path: Path, rows) -> Path:
+        path = tmp_path / "corpus.json"
+        path.write_text(json.dumps({"golden_paths": rows}), encoding="utf-8")
+        return path
+
+    def a_row(self, **overrides):
+        row = {
+            "kind": "shell",
+            "surface": "gh-read",
+            "command_or_flow": "gh pr view 1 --json state",
+            "platform": "any",
+            "reason": "reading a PR is how a loop decides what to do next",
+        }
+        row.update(overrides)
+        return row
+
+    def test_the_import_is_idempotent(self, mod, db, capsys, tmp_path):
+        corpus = self.a_corpus(
+            tmp_path, [self.a_row(), self.a_row(command_or_flow="git status --porcelain")]
+        )
+        run(mod, db, "import-golden-paths", str(corpus), "--approved-by", "reviewer")
+        assert out_json(capsys) == {"imported": 2, "skipped": 0, "total": 2}
+        run(mod, db, "import-golden-paths", str(corpus), "--approved-by", "reviewer")
+        assert out_json(capsys) == {"imported": 0, "skipped": 2, "total": 2}
+
+    def test_a_re_import_does_not_revive_a_retired_row(self, mod, db, capsys, tmp_path):
+        """Re-importing the file a row came from is not a decision to bring it back:
+        the retirement was a reviewer's call about this target."""
+        corpus = self.a_corpus(tmp_path, [self.a_row()])
+        run(mod, db, "import-golden-paths", str(corpus), "--approved-by", "reviewer")
+        capsys.readouterr()
+        run(mod, db, "list", "golden-paths")
+        path_id = out_json(capsys)[0]["id"]
+        run(mod, db, "deactivate-golden-path", "--id", str(path_id))
+        run(mod, db, "import-golden-paths", str(corpus), "--approved-by", "reviewer")
+        capsys.readouterr()
+        run(mod, db, "list", "golden-paths")
+        assert out_json(capsys)[0]["active"] == 0
+
+    def test_a_bare_json_list_is_accepted(self, mod, db, capsys, tmp_path):
+        path = tmp_path / "bare.json"
+        path.write_text(json.dumps([self.a_row()]), encoding="utf-8")
+        assert run(mod, db, "import-golden-paths", str(path), "--approved-by", "reviewer") == 0
+        assert out_json(capsys)["imported"] == 1
+
+    def test_a_malformed_file_writes_nothing(self, mod, db, capsys, tmp_path):
+        """All-or-nothing, and this is the failure that matters: a half-imported
+        corpus is a set of checks the reviewer did not choose, and the rows that
+        never landed are invisible."""
+        corpus = self.a_corpus(
+            tmp_path, [self.a_row(), self.a_row(command_or_flow="x", kind="wat")]
+        )
+        assert run(mod, db, "import-golden-paths", str(corpus), "--approved-by", "reviewer") == 2
+        assert "entry 1: unknown kind 'wat'" in capsys.readouterr().err
+        run(mod, db, "list", "golden-paths")
+        assert out_json(capsys) == []
+
+    @pytest.mark.parametrize(
+        "row, fragment",
+        [
+            pytest.param({"reason": ""}, "blank or missing reason", id="blank-reason"),
+            pytest.param({"surface": "  "}, "blank or missing surface", id="blank-surface"),
+            pytest.param({"platform": "darwin"}, "unknown platform", id="bad-platform"),
+            pytest.param({"source_finding_id": "1"}, "must be an integer", id="string-finding"),
+        ],
+    )
+    def test_every_field_is_checked_before_any_write(
+        self, mod, db, capsys, tmp_path, row, fragment
+    ):
+        corpus = self.a_corpus(tmp_path, [self.a_row(**row)])
+        assert run(mod, db, "import-golden-paths", str(corpus), "--approved-by", "reviewer") == 2
+        assert fragment in capsys.readouterr().err
+
+    def test_an_absent_file_is_refused(self, mod, db, capsys, tmp_path):
+        assert (
+            run(
+                mod,
+                db,
+                "import-golden-paths",
+                str(tmp_path / "nowhere.json"),
+                "--approved-by",
+                "reviewer",
+            )
+            == 2
+        )
+        assert "cannot read corpus" in capsys.readouterr().err
+
+    def test_a_cited_finding_must_exist_before_the_corpus_lands(self, mod, db, capsys, tmp_path):
+        corpus = self.a_corpus(tmp_path, [self.a_row(source_finding_id=404)])
+        assert run(mod, db, "import-golden-paths", str(corpus), "--approved-by", "reviewer") == 2
+        assert "no finding with id 404" in capsys.readouterr().err
+        run(mod, db, "list", "golden-paths")
+        assert out_json(capsys) == []
+
+
+class TestActiveGoldenPathsFiltersByHost:
+    def a_path(self, mod, db, capsys, command, platform):
+        run(
+            mod,
+            db,
+            "add-golden-path",
+            "--kind",
+            "shell",
+            "--surface",
+            "tests",
+            "--command",
+            command,
+            "--platform",
+            platform,
+            "--reason",
+            "the sanctioned test invocation",
+            "--approved-by",
+            "reviewer",
+        )
+        capsys.readouterr()
+
+    def test_each_host_sees_its_own_rows_and_the_shared_ones(self, mod, db, capsys):
+        self.a_path(mod, db, capsys, "posix-only", "posix")
+        self.a_path(mod, db, capsys, "windows-only", "windows")
+        self.a_path(mod, db, capsys, "shared", "any")
+        conn = mod.connect(db)
+        try:
+            mod.init_schema(conn)
+            for host, expected in (
+                ("posix", ["posix-only", "shared"]),
+                ("windows", ["windows-only", "shared"]),
+            ):
+                rows = mod.active_golden_paths(conn, platform=host)
+                assert [row["command_or_flow"] for row in rows] == expected
+        finally:
+            conn.close()
