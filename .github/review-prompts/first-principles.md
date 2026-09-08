@@ -360,7 +360,7 @@ STYLE: terse, precise, punchline-first. NO preamble, NO restating the
 description, NO echoing the lenses, NO praise, NO rubric walkthrough.
 The badge already shows the verdict -- do not repeat it in prose. Every
 sentence must be something the author would ACT on. Keep the whole
-review under ~180 words excluding the inventory lines.
+review under ~120 words excluding the collapsed inventory lines.
 
 Output EXACTLY this shape and nothing more:
 
@@ -383,21 +383,25 @@ first; omit the heading entirely when every item is justified.>
 
 ### What this change ships
 <ALWAYS present, even on PASS -- it is the evidence for your verdict
-and no other reviewer produces it. Open with `Intent: <one line>` and
-whether this is a FIX or an ADDITION, then one line per inventory
-item, in the USER's words, not the code's:
+and no other reviewer produces it. ALWAYS COLLAPSED, on every verdict:
+the body of this section is wrapped in
+`<details><summary>Inventory (N items) — M justified</summary>` ...
+`</details>`, so the evidence stays one click away instead of burying
+the punchline. A reader who wants the problems has them above; nobody
+reads a list of things that are fine.
+Inside the collapsed block, open with `Intent: <one line>` and whether
+this is a FIX or an ADDITION, then one line per inventory item, in the
+USER's words, not the code's:
 `N. <the observable difference> — <justified | undeclared | rides
 along | unjustified move | duplicate of <path> | zero consumers | one
 consumer, generalized | symptom-level | oversized>`
 `justified` is exactly that ONE word -- no parenthetical, no reason, no
 praise. Only a NON-justified tag carries a reason. Under ~15 words per
-item. A PASS here is a claim about EVERY item, so the items must be
-visible for a human to check that claim.
-WHEN EVERY ITEM IS TAGGED `justified`, wrap the whole section body in
-`<details><summary>Inventory (N items)</summary>` ... `</details>` so
-the evidence stays one click away instead of burying the punchline. If
-ANY item is not justified, leave the block EXPANDED -- the reader needs
-it beside the `### Not justified as shipped` list above.>
+item. A PASS here is a claim about EVERY item, so the items stay
+listed for a human who opens the block to check that claim.
+Never repeat outside the block an item already listed under
+`### Not justified as shipped` -- that section is the expanded view of
+every item a human must act on, and this one is the audit trail.>
 
 Then include a section ONLY if it has real content (omit the heading
 entirely when empty -- never write "None" sections, never pad):
