@@ -11,15 +11,14 @@ from typing import Any, Protocol
 
 from kiro_crew.dashboard.state import MONITOR_WAKE_PREFIX
 from kiro_crew.monitoring.decision import monitor_budget_reason
-from kiro_crew.monitoring.github_pull_request import (
-    GitHubPullRequestProbeResult,
-    GitHubPullRequestProvider,
-)
+from kiro_crew.monitoring.github_pull_request import GitHubPullRequestProvider
 from kiro_crew.monitoring.models import (
     MonitorDecision,
     MonitorDispatchResult,
     MonitorObservation,
     MonitorObservationStatus,
+    MonitorProbe,
+    MonitorProbeResult,
     MonitorState,
     MonitorVerdict,
     ProviderErrorKind,
@@ -31,6 +30,23 @@ MONITOR_WAKE_MAX_CHARS = 4096
 logger = logging.getLogger(__name__)
 
 
+def _transient_probe_failure() -> MonitorProbeResult:
+    """The result a probe that could not answer is treated as having returned.
+
+    Host-free on purpose: the controller reaches this without knowing which kind
+    it was probing, so it cannot construct that kind's own result type.
+    """
+    return MonitorProbeResult(
+        canonical={},
+        observation=MonitorObservation(
+            "",
+            MonitorObservationStatus.PROVIDER_ERROR,
+            provider_error=ProviderErrorKind.TRANSIENT,
+            reason_code="provider_transient",
+        ),
+    )
+
+
 class _Loop(Protocol):
     id: str
     monitor: MonitorState | None
@@ -40,7 +56,7 @@ class _Service(Protocol):
     async def apply_monitor_probe(
         self,
         monitor_id: str,
-        result: GitHubPullRequestProbeResult,
+        result: MonitorProbeResult,
         *,
         now: float,
         config_generation: int,
@@ -85,15 +101,6 @@ class _Service(Protocol):
     ) -> bool: ...
 
 
-class _Provider(Protocol):
-    def probe(
-        self,
-        raw_target: str,
-        *,
-        previous_observation: Mapping[str, object] | None = None,
-    ) -> GitHubPullRequestProbeResult: ...
-
-
 MonitorDispatcher = Callable[[Any, str], Awaitable[MonitorDispatchResult]]
 
 
@@ -105,7 +112,7 @@ class MonitorController:
         service: _Service,
         dispatch: MonitorDispatcher,
         *,
-        provider: _Provider | None = None,
+        provider: MonitorProbe | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._service = service
@@ -163,23 +170,22 @@ class MonitorController:
         target = state.target
         previous_observation = deepcopy(state.last_observation)
         try:
-            result = await asyncio.to_thread(
+            results = await asyncio.to_thread(
                 self._provider.probe,
-                target,
-                previous_observation=previous_observation,
+                (target,),
+                previous_observations={target: previous_observation},
             )
+            result = results[target]
         except Exception:
             logger.exception("structured monitor provider raised unexpectedly")
-            result = GitHubPullRequestProbeResult(
-                response=None,
-                canonical={},
-                observation=MonitorObservation(
-                    "",
-                    MonitorObservationStatus.PROVIDER_ERROR,
-                    provider_error=ProviderErrorKind.TRANSIENT,
-                    reason_code="provider_transient",
-                ),
-            )
+            result = _transient_probe_failure()
+        else:
+            if not isinstance(result, MonitorProbeResult):
+                # A provider that answers with the wrong shape is a fault, not a
+                # verdict. Failing closed here keeps the untyped value out of the
+                # decision engine, which has no way to reject it.
+                logger.error("structured monitor provider returned an untyped result")
+                result = _transient_probe_failure()
         verdict = await self._service.apply_monitor_probe(
             loop.id,
             result,

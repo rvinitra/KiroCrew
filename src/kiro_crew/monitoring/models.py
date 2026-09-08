@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 MONITOR_STATE_VERSION = 1
 DEFAULT_MONITOR_RUNTIME_SECS = 14_400
@@ -303,6 +304,59 @@ class MonitorVerdict:
         for entry in self.entries:
             if not isinstance(entry, MonitorObservation):
                 raise ValueError("every verdict entry must be a MonitorObservation")
+
+
+@dataclass(frozen=True)
+class MonitorProbeResult:
+    """What one probe learned about ONE subject, in terms the engine can read.
+
+    Names no host. ``canonical`` holds that subject's durable facts -- shaped by
+    the kind that produced them and opaque to the decision engine, which only
+    ever persists and compares it -- and ``observation`` is the generic
+    classification the engine acts on.
+
+    This is a RECORD rather than a bare list of per-check rows on purpose. A host
+    that publishes its own overall verdict, distinct from the rows a probe
+    enumerates, needs somewhere to put it, and a defaulted field added to a
+    record reaches every caller without changing this type's shape or any
+    signature that names it. A protocol returning a bare sequence would have to
+    change its return type instead, which is the cost this shape avoids.
+    """
+
+    canonical: dict[str, object]
+    observation: MonitorObservation
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.observation, MonitorObservation):
+            raise ValueError("observation must be a MonitorObservation")
+        if not isinstance(self.canonical, dict):
+            raise ValueError("canonical must be a dict")
+
+
+class MonitorProbe(Protocol):
+    """The external probe boundary, shared by every path that observes a subject.
+
+    PLURAL by contract even where an implementation loops internally: it takes a
+    sequence of subjects and returns one result per subject. A monitored kind
+    whose host answers for many subjects in one call -- most review and CI hosts
+    do -- can then satisfy this without the signature changing, and a caller that
+    wants one subject passes a one-element sequence.
+
+    The returned mapping is keyed by the subject string AS PASSED IN, not by any
+    identity the host derives from it. A caller can only look up what it asked
+    for, and a host is free to normalize a subject for its own use without that
+    reshaping the mapping its caller has to read.
+
+    Nothing in this signature names a host. That is what lets a second kind
+    satisfy the same boundary.
+    """
+
+    def probe(
+        self,
+        subjects: Sequence[str],
+        *,
+        previous_observations: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> Mapping[str, MonitorProbeResult]: ...
 
 
 @dataclass
