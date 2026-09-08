@@ -864,6 +864,34 @@ async def api_theme_overlay(request: web.Request) -> web.Response:
     return _theme_html_response(raw.decode("utf-8", errors="replace"))
 
 
+async def api_theme_loader(request: web.Request) -> web.Response:
+    """GET /api/theme/{slug}/loader — serve the pack's sandboxed loader HTML.
+
+    Same locked-down CSP + sandboxed-iframe posture as overlays/topbar (§8.2):
+    the loader renders decoratively in the chat footer and never touches the
+    dashboard origin.
+    """
+    # Offloaded, not inline: `_resolve_theme_asset` does SMB-backed resolve()/
+    # is_file() on a UNC data home. Rides the read executor like the routes above.
+    target, err = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(),
+        _resolve_theme_asset,
+        request.match_info["slug"],
+        "loader/loader.html",
+    )
+    if err or target is None:
+        return web.json_response(
+            {"error": err or "not found"},
+            status=400 if err and "invalid" in err else 404,
+        )
+    raw = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), _read_theme_bytes_nolink, request.match_info["slug"], target
+    )
+    if raw is None:
+        return web.json_response({"error": "not found"}, status=404)
+    return _theme_html_response(raw.decode("utf-8", errors="replace"))
+
+
 async def api_theme_topbar(request: web.Request) -> web.Response:
     """GET /api/theme/{slug}/topbar/{mode} — serve topbar HTML (mode dark|light)."""
     mode = request.match_info["mode"]

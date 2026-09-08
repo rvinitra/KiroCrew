@@ -163,7 +163,7 @@ describe('loader — theme seam', () => {
 
   it('resolves stock symbols selected by an installed theme manifest', () => {
     const names = ['star', 'sparkles', 'moon', 'cloud'] as const
-    expect(resolveLoaderIcons('custom-pearce-crt', names)).toEqual(
+    expect(resolveLoaderIcons('custom-pearce-crt', { loaderIcons: names })).toEqual(
       names.map(name => THEME_LOADER_ICONS[name]),
     )
   })
@@ -173,13 +173,35 @@ describe('loader — theme seam', () => {
     ['too few symbols', ['star', 'sparkles', 'moon']],
     ['duplicate symbols', ['star', 'sparkles', 'moon', 'star']],
   ])('falls back safely for manifest pools with %s', (_case, names) => {
-    expect(resolveLoaderIcons('custom-broken', names)).toBe(GHOST_POSE_ICONS)
+    expect(resolveLoaderIcons('custom-broken', { loaderIcons: names })).toBe(GHOST_POSE_ICONS)
   })
 
   it('keeps a trusted compiled custom loader ahead of manifest symbols', () => {
     registerThemeBranding({ 'seam-manifest-precedence': { loader: CustomLoader } })
-    const got = resolveLoader('seam-manifest-precedence', ['star', 'sparkles', 'moon', 'cloud'])
+    const got = resolveLoader('seam-manifest-precedence', { loaderIcons: ['star', 'sparkles', 'moon', 'cloud'] })
     expect(got.kind).toBe('custom')
+  })
+
+  // Installed packs (this PR): custom raster art and a sandboxed custom loader.
+  it('resolves an installed pack’s own raster loader images', () => {
+    const got = resolveLoaderIcons(
+      'custom-reef',
+      { loaderImages: ['loader/a.png', 'loader/b.webp', 'loader/c.png', 'loader/d.png'] },
+    )
+    expect(got.length).toBe(4)
+    const { container } = render(<>{got.map((Ic, i) => <Ic key={i} />)}</>)
+    const imgs = container.querySelectorAll('img')
+    expect(imgs.length).toBe(4)
+    expect(imgs[0].getAttribute('src')).toBe('/api/theme/reef/assets/loader/a.png')
+  })
+
+  it('gives an installed pack’s sandboxed loader precedence over its icons', () => {
+    const got = resolveLoader(
+      'custom-reef',
+      { hasLoaderHtml: true, loaderIcons: ['star', 'sparkles', 'moon', 'cloud'] },
+    )
+    expect(got.kind).toBe('sandboxed')
+    expect(got.kind === 'sandboxed' && got.src).toBe('/api/theme/reef/loader')
   })
 
   it('renders a registered theme’s icons in the footer', () => {

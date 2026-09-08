@@ -9383,7 +9383,8 @@
       "chatFooter": {
         "compacting": "Сжатие контекста…",
         "killing": "Завершение…",
-        "stopping": "Остановка…"
+        "stopping": "Остановка…",
+        "theme_loader": "Загрузчик темы"
       },
       "chatNavPanel": {
         "link": "Ссылка",
