@@ -14,9 +14,11 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -2767,6 +2769,61 @@ async def test_worktree_detail_survives_pod_probe_failure(monkeypatch, tmp_path)
     assert detail["pod_running"] is False
     assert detail["disk_mb"] is None
     assert detail["commits"] == []
+
+
+def test_dir_size_bytes_does_not_follow_a_directory_link():
+    """A directory symlink/junction inside the tree must not be walked into.
+
+    GPT 5.6 review on PR #9413: ``entry.is_dir(follow_symlinks=False)`` still
+    reports True for a Windows junction (a reparse point, not a symlink), so a
+    naive walk pushes it and recurses through the link's target -- unbounded
+    on a cycle (a link pointing back at an ancestor) and potentially an
+    outbound SMB connection if the target is a network share.
+
+    A real junction cannot be created on this (POSIX) test host, and a plain
+    symlink does not reproduce the bug: ``is_dir(follow_symlinks=False)``
+    already reports False for a symlink on every platform, so the pre-fix code
+    was never reachable through one -- only a junction's ``is_dir(False) ==
+    True`` reaches the vulnerable branch. So this drives the SAME code path
+    the real bug lives in by monkeypatching ``os.DirEntry.is_dir`` to answer
+    the way a junction's DirEntry would (True even with follow_symlinks=False)
+    for one specific path, and asserts ``is_link_or_junction`` -- not
+    ``is_dir`` -- is what the walk consults before recursing into it.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.fleet_state as fleet_state_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        root = base / "walked-root"
+        root.mkdir()
+        (root / "real.bin").write_bytes(b"x" * 1000)
+        outside = base / "outside-target"
+        outside.mkdir()
+        (outside / "elsewhere.bin").write_bytes(b"y" * 5000)
+        junction_path = root / "junction-to-outside"
+        # No real reparse point on POSIX; a symlink stands in as the on-disk
+        # object so scandir yields a real DirEntry, but its is_dir() answer is
+        # forced below to the junction shape the fix must handle.
+        junction_path.symlink_to(outside, target_is_directory=True)
+        real_is_dir = os.DirEntry.is_dir
+        real_is_link_or_junction = fleet_state_mod.is_link_or_junction
+
+        def fake_is_dir(self, *, follow_symlinks=True):
+            if self.path == str(junction_path):
+                return True
+            return real_is_dir(self, follow_symlinks=follow_symlinks)
+
+        def fake_is_link_or_junction(path):
+            if str(path) == str(junction_path):
+                return True
+            return real_is_link_or_junction(path)
+
+        with mock.patch.object(os.DirEntry, "is_dir", fake_is_dir), mock.patch.object(
+            fleet_state_mod, "is_link_or_junction", fake_is_link_or_junction
+        ):
+            size = fleet_state_mod._dir_size_bytes(str(root))
+
+    assert size == 1000, "the walk must count only real.bin, never through the junction"
 
 
 def test_main_boots_platform_before_serving(monkeypatch):
