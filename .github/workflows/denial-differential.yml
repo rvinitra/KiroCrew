@@ -1,0 +1,188 @@
+name: Denial Differential
+
+# Fails a deny-rule change that newly refuses an operation the product depends
+# on. A security fix is almost always a rule made stricter, and "stricter" has no
+# upper bound a reviewer can see: the author reads the attack the pattern now
+# catches, nobody reads the ordinary commands it also newly matches. The symptom
+# lands days later as an agent that stopped working, reporting a pattern instead
+# of a cause.
+#
+# Deterministic, no model. `scripts/deny_diff.py` classifies a corpus of golden
+# paths -- operations legitimate BY DECISION, each with the reason -- with the
+# REAL classifier as it exists at the base ref and at the head ref, and diffs the
+# two verdict sets. Newly refused is a failure; newly allowed is reported and
+# does not block, because loosening is what a revert or a false-positive fix
+# looks like.
+#
+# Matrix, and why all three legs: the rules read argv SHAPE, and the tokenizer,
+# the path fence and the self-protection floor all behave differently on Windows.
+# A gate that only ran on Linux would pass a tightening that breaks every Windows
+# operator -- the same class of defect the Cross-Platform Portability gate exists
+# for and cannot see, because that one reads added lines rather than behaviour.
+#
+# No dependency install: the classifier's import chain is stdlib plus the package's
+# own modules, and the child reaches them through PYTHONPATH at a materialized
+# checkout. Installing the package would add three platform-dependent minutes and
+# a resolution failure mode, and an editable install would put a SECOND copy of
+# `kiro_crew` on the path -- which the script's own tree check would then refuse.
+#
+# Honest red, no continue-on-error: a failing leg shows as failing, and branch
+# protection decides whether that blocks a merge.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "src/kiro_crew/security/**"
+      - "src/kiro_crew/deny_guidance.py"
+      - "src/kiro_crew/platform/security_authority.py"
+      - "src/kiro_crew/builtin_skills/security-conductor/rules-of-engagement.json"
+      - "src/kiro_crew/builtin_skills/security-conductor/golden-paths.seed.json"
+      - "scripts/deny_diff.py"
+      - "scripts/deny_diff_fixture.json"
+      - ".github/workflows/denial-differential.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: denial-differential-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  denial-differential:
+    name: Denial Differential (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      # Every leg reports. One platform's regression is not evidence about
+      # another's, so a fail-fast cancel would hide the rows an operator on the
+      # cancelled runner is the only one who can see.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: BOTH commits must be archivable locally, and a shallow
+          # clone of the merge ref has neither parent's tree.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Run the denial differential
+        id: diff
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+
+          # The security-conductor's own seed is authoritative the moment it lands
+          # on the branch; the fixture is the fallback until then. Resolved here
+          # rather than inside the script so the report names which corpus answered.
+          seed="src/kiro_crew/builtin_skills/security-conductor/golden-paths.seed.json"
+          corpus="scripts/deny_diff_fixture.json"
+          if [ -f "$seed" ]; then
+            corpus="$seed"
+          fi
+          echo "corpus=$corpus" >> "$GITHUB_OUTPUT"
+
+          # `git archive` needs the OBJECTS, not just the refs. fetch-depth: 0
+          # normally supplies both, so fetch only what is genuinely absent.
+          for sha in "$BASE_SHA" "$HEAD_SHA"; do
+            if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$sha" || true
+            fi
+          done
+
+          rc=0
+          python scripts/deny_diff.py \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --corpus "$corpus" \
+            --platform auto > report.md 2>error.log || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+          cat report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -s error.log ]; then
+            cat error.log
+            {
+              echo
+              echo '```'
+              cat error.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # The verdict is the next step's job. Exiting non-zero here would skip it
+          # and lose the label check with it.
+          exit 0
+
+      - name: Judge the report
+        shell: bash
+        env:
+          RC: ${{ steps.diff.outputs.rc }}
+          CORPUS: ${{ steps.diff.outputs.corpus }}
+          # Escape hatch for a tightening whose newly-refused rows are the POINT of
+          # the change (a golden path that should never have been one, or a row the
+          # same PR removes from the seed). The label is not the justification: the
+          # reviewer applying it must name the excused rows in a PR comment, because
+          # a bare label records that someone waved the gate through without
+          # recording what they waved through. The job still runs and still reports
+          # every row either way -- the label moves the exit code, never the
+          # visibility.
+          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'deny-diff-approved') }}
+        run: |
+          set -uo pipefail
+          echo "Corpus: $CORPUS"
+
+          if [ "$RC" = "0" ]; then
+            echo "No newly-refused golden paths."
+            exit 0
+          fi
+
+          if [ "$RC" = "2" ]; then
+            echo "::error::deny_diff could not run (corpus or ref error) -- see the job summary."
+            {
+              echo
+              echo "**The differential did not run.** A corpus or ref error is not a pass,"
+              echo "and the \`deny-diff-approved\` label does not excuse it."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # The Regressions block only: the report's own loosenings list has the
+          # same row shape, and the label must never read as excusing a loosening.
+          rows="$(awk '
+            /^\*\*Regressions/ { inblock = 1; next }
+            inblock && $0 == "" { if (seen) exit; next }
+            inblock { seen = 1; print }
+          ' report.md)"
+          if [ "$APPROVED" = "true" ]; then
+            {
+              echo
+              echo "The \`deny-diff-approved\` label is EXCUSING these rows:"
+              echo
+              printf '%s\n' "$rows"
+              echo
+              echo "The reviewer who applied the label must have named these rows in a PR"
+              echo "comment. A row above that is not in that comment is not covered."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::'deny-diff-approved' present -- newly-refused golden paths reported but not blocking."
+            printf 'Excused rows:\n%s\n' "$rows"
+            exit 0
+          fi
+
+          {
+            echo
+            echo "Each row above is an operation the corpus records as legitimate that this"
+            echo "change newly refuses. Narrow the rule, or -- if the refusal is the point --"
+            echo "add the \`deny-diff-approved\` label AND a PR comment naming every row it excuses."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Newly-refused golden paths -- see the job summary."
+          exit 1
