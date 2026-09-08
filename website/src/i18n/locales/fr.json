@@ -14341,6 +14341,7 @@
     "membersPage": {
       "agent_template": "Modèle d'agent",
       "configuration": "Configuration",
+      "crew_summary": "Résumé du membre",
       "details": "Détails",
       "edit_in_crew_manager": "Modifier dans le gestionnaire d'équipes",
       "empty_roster": "Aucun membre pour l'instant. Créez une équipe dans le gestionnaire pour la voir ici.",

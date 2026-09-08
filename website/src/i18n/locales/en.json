@@ -6935,6 +6935,7 @@
     "membersPage": {
       "agent_template": "Agent template",
       "configuration": "Configuration",
+      "crew_summary": "Crew summary",
       "details": "Details",
       "edit_in_crew_manager": "Edit in crew manager",
       "empty_roster": "No crew members yet. Create a crew in the crew manager to see it here.",

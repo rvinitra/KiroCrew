@@ -14340,6 +14340,7 @@
     "membersPage": {
       "agent_template": "Modello di agente",
       "configuration": "Configurazione",
+      "crew_summary": "Riepilogo membro",
       "details": "Dettagli",
       "edit_in_crew_manager": "Modifica nel gestore delle crew",
       "empty_roster": "Ancora nessun membro. Crea una crew nel gestore per vederla qui.",
